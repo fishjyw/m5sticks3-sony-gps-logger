@@ -176,7 +176,12 @@ bool File::nextEntry(void) {
 File File::openNextFile(void) {
   File f;
   if (m_dir == nullptr) return f;
-  if (!nextEntry()) return f;
+  // openDir() already opened the FIRST entry into m_fp; return that one
+  // instead of calling nextEntry() again -- otherwise the first FILE handle
+  // is silently overwritten and leaked (~880 B per directory scan).
+  if (m_fp == nullptr) {
+    if (!nextEntry()) return f;
+  }
   f.m_fp = m_fp;
   m_fp = nullptr;  // ownership moved to the returned file
   memcpy(f.m_name, m_name, sizeof m_name);

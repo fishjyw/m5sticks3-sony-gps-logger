@@ -204,7 +204,7 @@ static HardwareSerial GPSSerial(2);
 #define GPScam_NAME "Sony Camera GPS Logger"
 #define GPScam_VER_MAJOR 4
 #define GPScam_VER_MINOR 7
-#define GPScam_VER_PATCH 1
+#define GPScam_VER_PATCH 3
 #define GPScam_VERSION_STR(maj, min, pat) \
   #maj "." #min "." #pat
 #define GPScam_VERSION_NO_V \
@@ -563,6 +563,27 @@ static bool initFS() {
   fsOk = true;
   return true;
 }
+
+// 事件日志：只记录开机原因、录制起停、BLE 状态等关键点，用于事后判断
+// 是崩溃重启、看门狗还是断电。超过 16 KB 时清空重来。
+static void eventLog(const char *fmt, ...) {
+  if (!fsOk) return;
+  File ck = LittleFS.open("/events.log");
+  size_t sz = ck ? ck.size() : 0;
+  ck.close();
+  if (sz > 16384) LittleFS.remove("/events.log");
+  File f = LittleFS.open("/events.log", "a");
+  if (!f) return;
+  char b[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = snprintf(b, sizeof b, "%8lu ", (unsigned long)millis());
+  if (n > 0 && n < (int)sizeof b) vsnprintf(b + n, sizeof b - n, fmt, ap);
+  va_end(ap);
+  f.print(b);
+  f.print("\n");
+  f.close();
+}
 static void powerOffNow();             // defined later in the button section
 
 // Enumerate the root dir instead of open()-ing a possibly missing path:
@@ -721,6 +742,7 @@ static bool startRecording() {
   trackPoints = 0;
   recStartSecs = gpsEpochSecs(gps);
   recording = true;
+  eventLog("[REC] start %s heap=%u", trackName, (unsigned)esp_get_free_heap_size());
   return true;
 }
 static void stopRecording() {
@@ -728,6 +750,8 @@ static void stopRecording() {
   trackFile.print("</trkseg></trk></gpx>\n");
   trackFile.flush();
   trackFile.close();
+  eventLog("[REC] stop %s pts=%u heap=%u", trackName, (unsigned)trackPoints,
+           (unsigned)esp_get_free_heap_size());
   recording = false;
 }
 static void writeTrackpoint() {
@@ -753,6 +777,7 @@ static void writeTrackpoint() {
 }
 
 // ---------------- USB serial export ----------------
+static void pmicWdtFeed(void);          // PMIC 看门狗，定义在 setup 附近
 static void setStatus(const char *m);
 static void drawOutputUI();
 static void drawMainUI();
@@ -786,6 +811,7 @@ static void dumpAllGpx() {
       while ((got = f.read(buf, sizeof(buf))) > 0) Serial.write(buf, got);
       Serial.write('\n');
       Serial.println("#GPX_END");
+      pmicWdtFeed();               // 导出可能超过 255s，逐个文件喂狗
       n++;
     }
     f = root.openNextFile();
@@ -1728,6 +1754,7 @@ static void checkBattery() {
     if (++lowBatHits >= 2) {                 // 2 checks x 10 s, avoid spikes
       lowBatHits = 0;
       lowBatLock = true;
+      eventLog("[REC] low-battery stop bat=%d", batteryLevel);
       stopRecording();
       countFilesCache = -1;
       setStatus("LOW BAT - REC STOPPED");
@@ -1788,6 +1815,17 @@ static void handleSerialCmd() {
       fileLogSuspend(false);
     }
     else if (c == 'L') { listGpx(); }
+    else if (c == 'K') {                   // 导出 /events.log（开机/录制/蓝牙事件）
+      File ef = LittleFS.open("/events.log");
+      Serial.println("#EVENTS_BEGIN");
+      if (ef) {
+        uint8_t eb[256];
+        int got;
+        while ((got = ef.read(eb, sizeof(eb))) > 0) Serial.write(eb, got);
+        ef.close();
+      }
+      Serial.println("#EVENTS_END");
+    }
     else if (c == 'T') { makeTestGpx(); }
     else if (c == 'X') { cleanTestGpx(); }
     else if (c == 'M') {
@@ -1831,14 +1869,30 @@ static void handleSerialCmd() {
                     (int)rc.source, (unsigned)rc.div, (unsigned)cpuMhzNow,
                     pmReady ? 1 : 0);
       {
+        uint8_t r04 = M5.In_I2C.readRegister8(0x6E, 0x04, 100000);
+        uint8_t r05 = M5.In_I2C.readRegister8(0x6E, 0x05, 100000);
         uint8_t r06 = M5.In_I2C.readRegister8(0x6E, 0x06, 100000);
         uint8_t r07 = M5.In_I2C.readRegister8(0x6E, 0x07, 100000);
         uint8_t r08 = M5.In_I2C.readRegister8(0x6E, 0x08, 100000);
+        uint8_t r0A = M5.In_I2C.readRegister8(0x6E, 0x0A, 100000);
         uint8_t r49 = M5.In_I2C.readRegister8(0x6E, 0x49, 100000);
         uint8_t r4A = M5.In_I2C.readRegister8(0x6E, 0x4A, 100000);
         uint8_t r0C = M5.In_I2C.readRegister8(0x6E, 0x0C, 100000);
-        Serial.printf("[PMIC] pwr=06:%02X hold=07:%02X lvp=08:%02X btn1=49:%02X btn2=4A:%02X sys=0C:%02X\n",
-                      r06, r07, r08, r49, r4A, r0C);
+        Serial.printf("[PMIC] src=04:%02X wake=05:%02X pwr=06:%02X hold=07:%02X lvp=08:%02X wdt=0A:%02X btn1=49:%02X btn2=4A:%02X sys=0C:%02X\n",
+                      r04, r05, r06, r07, r08, r0A, r49, r4A, r0C);
+      }
+      {
+        uint32_t h0 = esp_get_free_heap_size();
+        for (int i = 0; i < 100; i++) {
+          volatile uint64_t a = LittleFS.totalBytes();
+          volatile uint64_t b = LittleFS.usedBytes();
+          (void)a; (void)b;
+        }
+        uint32_t h1 = esp_get_free_heap_size();
+        for (int i = 0; i < 20; i++) { countFilesCache = -1; countFiles(); }
+        uint32_t h2 = esp_get_free_heap_size();
+        Serial.printf("[MEM] fs_info=-%u/100x countFiles=-%u/20x\n",
+                      (unsigned)(h0 - h1), (unsigned)(h1 - h2));
       }
       FILE *f = fopen("/littlefs/pm.txt", "w");
       if (f) {
@@ -2145,6 +2199,8 @@ static void manageSelectTimeout() {
 
 // Graceful shutdown: close GPX, then ask M5PM1 to cut L2/L3 power.
 static void powerOffNow() {
+  eventLog("[PWR] off rec=%d autoOff=%d bat=%d", recording ? 1 : 0,
+           autoOffReason ? 1 : 0, batteryLevel);
   if (recording) stopRecording();
   if (exportMode) exitExportScreen();
   auto &d = M5.Display;
@@ -2198,6 +2254,35 @@ static uint32_t probeBaud(int rxPin, int txPin, uint32_t baud, uint32_t ms) {
   }
   GPSSerial.end();
   return dollars;
+}
+
+static const char *resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT_PIN";
+    case ESP_RST_SW:        return "SOFTWARE";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    case ESP_RST_USB:       return "USB";
+    case ESP_RST_JTAG:      return "JTAG";
+    case ESP_RST_EFUSE:     return "EFUSE";
+    case ESP_RST_PWR_GLITCH:return "PWR_GLITCH";
+    case ESP_RST_CPU_LOCKUP:return "CPU_LOCKUP";
+    default:                return "OTHER";
+  }
+}
+
+// PMIC 看门狗：M5PM1 自带一个 255 秒倒计时（寄存器 0x0A），倒计时到 0 会
+// 直接切断整机电源。furble 以前把它打开并定期喂狗，我们没喂，于是录制
+// 约 4 分钟后整机断电（GPX 没有结尾标签、下次开机 reset_reason=POWERON）。
+// 这里按 10 秒周期喂狗（0x0B 写 0xA5），保留 PMIC 保护。
+static void pmicWdtFeed(void) {
+  M5.In_I2C.writeRegister8(0x6E, 0x0B, 0xA5, 100000);
 }
 
 // PMIC（M5PM1, 0x6E）按钮配置：默认双击关机是关闭的，且这个设置可能被
@@ -2257,23 +2342,9 @@ void setup() {
   M5.Display.setTextWrap(false);
   Serial.println("[LOG] M5 up");
   pmicEnableDoubleOff();          // 恢复电源键双击关机
-  {
-    const char *rn = "OTHER";
-    switch (bootReason) {
-      case ESP_RST_POWERON:   rn = "POWERON";   break;
-      case ESP_RST_EXT:       rn = "EXT_PIN";   break;
-      case ESP_RST_SW:        rn = "SOFTWARE";  break;
-      case ESP_RST_PANIC:     rn = "PANIC";     break;
-      case ESP_RST_INT_WDT:   rn = "INT_WDT";   break;
-      case ESP_RST_TASK_WDT:  rn = "TASK_WDT";  break;
-      case ESP_RST_WDT:       rn = "WDT";       break;
-      case ESP_RST_DEEPSLEEP: rn = "DEEPSLEEP"; break;
-      case ESP_RST_BROWNOUT:  rn = "BROWNOUT";  break;
-      case ESP_RST_SDIO:      rn = "SDIO";      break;
-      default: break;
-    }
-    Serial.printf("[LOG] reset_reason=%d (%s)\n", (int)bootReason, rn);
-  }
+  pmicWdtFeed();                  // 立刻喂一次 PMIC 看门狗（255s 断电）
+  Serial.printf("[LOG] reset_reason=%d (%s)\n", (int)bootReason,
+                resetReasonName(bootReason));
 
   M5.Power.setExtOutput(true, m5::ext_PA);
 
@@ -2294,6 +2365,15 @@ void setup() {
                 fsOk ? (unsigned)(LittleFS.totalBytes() - LittleFS.usedBytes()) : 0u);
   loadKeySwap();
   loadSettings();
+  {
+    uint8_t wsrc = M5.In_I2C.readRegister8(0x6E, 0x05, 100000);
+    uint8_t psrc = M5.In_I2C.readRegister8(0x6E, 0x04, 100000);
+    uint8_t wdt  = M5.In_I2C.readRegister8(0x6E, 0x0A, 100000);
+    eventLog("[BOOT] reason=%s(%d) heap=%u wake=05:%02X src=04:%02X wdt=0A:%02X bat=%dmV",
+             resetReasonName(bootReason), (int)bootReason,
+             (unsigned)esp_get_free_heap_size(), wsrc, psrc, wdt,
+             (int)M5.Power.getBatteryVoltage());
+  }
   cpuInit();                           // 电源计划：默认 80 MHz，操作时提速
 
   // ---- BLE: furble Sony 协议栈（含 A7R4 bit2 补丁） ----
@@ -2316,7 +2396,7 @@ void setup() {
       Serial.printf("[BLE] identity %02X:%02X:%02X:%02X:%02X:%02X\n", id[5], id[4], id[3],
                     id[2], id[1], id[0]);
     }
-    xTaskCreate(control_task, "control", 8192, &Furble::Control::getInstance(), 4, NULL);
+    xTaskCreate(control_task, "control", 12288, &Furble::Control::getInstance(), 4, NULL);
     if (Furble::CameraList::getSaveCount() > 0) {
       Furble::CameraList::clear();
       Furble::CameraList::load();
@@ -2359,6 +2439,13 @@ void loop() {
   manageSelectTimeout();
   servicePrompt();
   cpuService();                        // 提速窗口结束则回落到 80 MHz
+  {
+    static uint32_t lastWdtFeed = 0;
+    if (millis() - lastWdtFeed >= 10000) {   // PMIC 看门狗 255s，10s 喂一次
+      lastWdtFeed = millis();
+      pmicWdtFeed();
+    }
+  }
   checkBattery();
 
   // BLE 状态切换（连接/配对/写入）临时提速，完成后自然回落
@@ -2366,6 +2453,11 @@ void loop() {
     static auto lastCtl = Furble::Control::STATE_IDLE;
     auto ctl = Furble::Control::getInstance().getState();
     if (ctl != lastCtl) {
+      static uint32_t lastBleLog = 0;   // 连接重试时状态会反复跳，限流写 flash
+      if (millis() - lastBleLog >= 5000) {
+        lastBleLog = millis();
+        eventLog("[BLE] state %d heap=%u", (int)ctl, (unsigned)esp_get_free_heap_size());
+      }
       if (ctl == Furble::Control::STATE_CONNECTING ||
           ctl == Furble::Control::STATE_CONNECT ||
           ctl == Furble::Control::STATE_ACTIVE) {
@@ -2402,10 +2494,11 @@ void loop() {
   static uint32_t lastBeat = 0;
   if (!dumping && millis() - lastBeat >= 5000) {
     lastBeat = millis();
-    Serial.printf("[HB] t=%lu rec=%d exp=%d fix=%d sats=%d dim=%d mode=%d bat=%d cpu=%u\n",
+    Serial.printf("[HB] t=%lu rec=%d exp=%d fix=%d sats=%d dim=%d mode=%d bat=%d cpu=%u heap=%u\n",
                   (unsigned long)millis(), recording, exportMode, gps.valid,
                   gps.sats, dimmed, (int)uiMode, batteryLevel,
-                  (unsigned)(esp_clk_cpu_freq() / 1000000));
+                  (unsigned)(esp_clk_cpu_freq() / 1000000),
+                  (unsigned)esp_get_free_heap_size());
   }
   delay(2);
 }
