@@ -204,7 +204,7 @@ static HardwareSerial GPSSerial(2);
 
 #define GPScam_NAME "Sony Camera GPS Logger"
 #define GPScam_VER_MAJOR 4
-#define GPScam_VER_MINOR 8
+#define GPScam_VER_MINOR 9
 #define GPScam_VER_PATCH 0
 #define GPScam_VERSION_STR(maj, min, pat) \
   #maj "." #min "." #pat
@@ -333,6 +333,16 @@ static uint32_t dimAfterMs   = DIM_AFTER_MS;
 static uint32_t autoOffMs    = AUTO_OFF_MS;   // 0 = never (legacy value)
 static uint8_t  brightHigh   = BRIGHT_HIGH;   // normal (awake) brightness
 static bool     promptOn     = true;
+
+// 自动记录（4.9.0）：菜单里手动开启；开启后每次开机拿到 GPS 时间就自动
+// 开始记录，空闲自动关机固定为 30 分钟。autoRecStarted 表示本次开机已自动
+// 启动过（用户手动停止后不再自动重启）。
+#define AUTO_REC_OFF_MS (30u * 60u * 1000u)
+static bool     autoRec        = false;
+static bool     autoRecStarted = false;
+static uint32_t effectiveAutoOffMs(void) {
+  return autoRec ? AUTO_REC_OFF_MS : autoOffMs;
+}
 
 // ---------------- GNSS constellation selection (v11) ----------------
 // AT6668 speaks NMEA 4.1 out and CASIC "$PCAS04,mode*cs" in. The strings
@@ -704,10 +714,11 @@ static void manageIdle() {
   // 2.0.1: never auto power off from inside a sub page. The page itself
   // returns to the main screen after SUBPAGE_TIMEOUT_MS, and powering off on
   // USB would have ended up as an esp_restart() (a "phantom reboot").
+  const uint32_t offMs = effectiveAutoOffMs();
   if (!recording && !exportMode && !usbPlugged() && uiMode == UI_MAIN
       && !FurbCam::isActive()  // 相机连接中禁止自动关机
-      && autoOffMs > 0 && now - lastActivityMs >= autoOffMs) {
-    Serial.printf("[PWR] auto off: %lus idle\n", (unsigned long)(autoOffMs / 1000));
+      && offMs > 0 && now - lastActivityMs >= offMs) {
+    Serial.printf("[PWR] auto off: %lus idle\n", (unsigned long)(offMs / 1000));
     autoOffReason = true;
     powerOffNow();
   }
@@ -898,6 +909,7 @@ static char     cpuBadgeTxt[6] = "";
 static uint16_t cpuBadgeCol = 0;
 static void cpuBadgeInvalidate(void) { cpuBadgeTxt[0] = 0; }
 static void chgTextInvalidate(void);   // 定义在充电文字绘制处
+static void autoBadgeInvalidate(void); // 定义在 AUTO 角标绘制处
 static const char *statusMsg = "";
 static uint32_t statusMsgMs = 0;
 static void setStatus(const char *m) { statusMsg = m; statusMsgMs = millis(); }
@@ -914,6 +926,7 @@ static void uiReset() {
   portChromeReady = false;      // dividers were wiped by the full fill
   cpuBadgeInvalidate();         // 全屏清过，频率角标要重画
   chgTextInvalidate();          // 充电文字同样要重画
+  autoBadgeInvalidate();        // AUTO 角标也要重画
 }
 
 // ---------------- sub-page text helpers (ASCII Font0 ONLY) ----------------
@@ -1053,16 +1066,25 @@ static int countFiles() {
 // The old bottom horizontal menu bar is gone. Pressing MID on the main
 // screen now opens a full-screen vertical MENU page; FRONT confirms the
 // highlighted entry, the trailing EXIT returns to the main screen.
-static const char *MENU_LABELS[] = {"文件", "相机", "设置", "导出", "关机", "退出"};
-static const int   MENU_COUNT = 6;
+// 3 号项是"自动记录"开关，显示 开/关 状态（4.9.0）
+static const char *MENU_LABELS[] = {"文件", "相机", "设置", "自动", "导出", "关机", "退出"};
+static const int   MENU_COUNT = 7;
+#define MENU_AUTO_IDX 3
 
 static void drawMenuUI() {
   auto &d = M5.Display;
   useAsciiFont();
   d.fillScreen(TFT_BLACK);
   uiText(4, 4, "菜单", TFT_CYAN, TFT_BLACK, 2);
+  char lab[24];
   for (int i = 0; i < MENU_COUNT; i++) {
-    uiSelectRowP(2, 44 + i * 32, MENU_LABELS[i], i == menuIndex);
+    const char *s = MENU_LABELS[i];
+    if (i == MENU_AUTO_IDX) {
+      snprintf(lab, sizeof lab, "自动 %s", autoRec ? "开" : "关");
+      s = lab;
+    }
+    // 7 行：y=40 起、28 px 间距，最后一行底部 230 px，仍在 240 px 屏内
+    uiSelectRowP(2, 40 + i * 28, s, i == menuIndex);
   }
   clearRowCache();
   d.waitDMA();
@@ -1089,6 +1111,24 @@ static void drawChargingText(bool plugged, bool full) {
     d.setTextColor(state == 2 ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
     d.setCursor(54, 146);
     d.print("CHG");
+  }
+}
+
+// 时钟行右上角的 AUTO 指示：开启自动记录后显示；自动开始记录后转为绿色。
+static int8_t autoBadgeShown = -1;   // -1 未画, 0 隐藏, 1 黄(待启动), 2 绿(已启动)
+static void autoBadgeInvalidate(void) { autoBadgeShown = -1; }
+static void drawAutoBadge(void) {
+  int state = autoRec ? (autoRecStarted ? 2 : 1) : 0;
+  if (state == autoBadgeShown) return;
+  autoBadgeShown = (int8_t)state;
+  auto &d = M5.Display;
+  useAsciiFont();
+  d.setTextSize(1);
+  d.fillRect(104, 4, 31, 10, TFT_BLACK);
+  if (state != 0) {
+    d.setTextColor(state == 2 ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+    d.setCursor(107, 6);
+    d.print("AUTO");
   }
 }
 
@@ -1141,11 +1181,12 @@ static void batteryRuntimeText(bool plugged, char *out, size_t n) {
 // the MID:MENU hint. The row index differs per layout, so it is a parameter.
 static void drawBottomRow(int row) {
   char b[40];
+  const uint32_t offMs = effectiveAutoOffMs();
   if (statusMsg[0] && millis() - statusMsgMs < 2500) {
     putRow(row, TFT_YELLOW, statusMsg);
-  } else if (!recording && !exportMode && !usbPlugged() && autoOffMs > 60000u
-             && millis() - lastActivityMs > autoOffMs - 60000u) {
-    uint32_t left = (autoOffMs - (millis() - lastActivityMs)) / 1000;
+  } else if (!recording && !exportMode && !usbPlugged() && offMs > 60000u
+             && millis() - lastActivityMs > offMs - 60000u) {
+    uint32_t left = (offMs - (millis() - lastActivityMs)) / 1000;
     if (left >= 60) snprintf(b, sizeof(b), "AUTO OFF %lum", (unsigned long)((left + 59) / 60));
     else            snprintf(b, sizeof(b), "AUTO OFF %lus", (unsigned long)left);
     putRow(row, TFT_ORANGE, b);
@@ -1171,6 +1212,7 @@ static void drawPortraitChrome() {
 static void drawMainPortrait() {
   char b[40];
   drawPortraitChrome();
+  drawAutoBadge();
 
   // P_CLOCK: time only (8 size2 chars = 96 px of the 135 px width).
   if (gps.timeValid) {
@@ -1627,13 +1669,13 @@ static void loadSettings() {
   while (f) {
     const char *nm = f.name();
     if (!strcmp(nm, "settings.cfg") || !strcmp(nm, "/settings.cfg")) {
-      char b[64];
+      char b[96];
       int n = (int)f.readBytesUntil('\n', b, sizeof(b) - 1);
       b[n > 0 ? n : 0] = 0;
       int r = 10, d = 30, a = 300, bp = 1, dl = 12, bh = BRIGHT_HIGH;
-      int gm = 0, rm = 1, oc = 0, rv = 0;
-      int got = sscanf(b, "%d %d %d %d %d %d %d %d %d %d",
-                       &r, &d, &a, &bp, &dl, &bh, &gm, &rm, &oc, &rv);
+      int gm = 0, rm = 1, oc = 0, rv = 0, ar = 0;
+      int got = sscanf(b, "%d %d %d %d %d %d %d %d %d %d %d",
+                       &r, &d, &a, &bp, &dl, &bh, &gm, &rm, &oc, &rv, &ar);
       if (got >= 5) {
         // Snap to the slider steps so a legacy value (e.g. 300 s auto-off)
         // can never leave the knob between two positions.
@@ -1647,15 +1689,17 @@ static void loadSettings() {
       }
       if (got >= 7) gnssMode   = (uint8_t)constrain(gm, 0, GNSS_COUNT - 1);
       if (got >= 9) outputChoice = (uint8_t)constrain(oc, 0, OUTPUT_METHODS - 1);
+      if (got >= 11) autoRec = (ar != 0);   // 4.9.0: 自动记录开关
       (void)rm;  // field 8 = 旧旋转设置，横屏移除后忽略
       (void)rv;
       f.close();
-      Serial.printf("[SET] loaded rec=%us dim=%u after=%lus off=%lus bright=%u prompt=%d gnss=%s out=%s\n",
+      Serial.printf("[SET] loaded rec=%us dim=%u after=%lus off=%lus bright=%u prompt=%d gnss=%s out=%s auto=%d\n",
                     (unsigned)recIntervalS, (unsigned)dimLevel,
                     (unsigned long)(dimAfterMs / 1000),
                     (unsigned long)(autoOffMs / 1000),
                     (unsigned)brightHigh, promptOn ? 1 : 0,
-                    GNSS_LABELS[gnssMode], OUTPUT_LABELS[outputChoice]);
+                    GNSS_LABELS[gnssMode], OUTPUT_LABELS[outputChoice],
+                    autoRec ? 1 : 0);
       return;
     }
     f = root.openNextFile();
@@ -1668,10 +1712,11 @@ static void saveSettings() {
   char b[96];
   // Field 8 (rotation) is written as 0 for backward-compatible parsing;
   // 4.5.0 fixed the UI to portrait so it is no longer meaningful.
-  snprintf(b, sizeof(b), "%u %lu %lu %d %u %u %u %u %u 2\n", (unsigned)recIntervalS,
+  // Field 11 (4.9.0) = auto-record toggle.
+  snprintf(b, sizeof(b), "%u %lu %lu %d %u %u %u %u %u 2 %d\n", (unsigned)recIntervalS,
            (unsigned long)(dimAfterMs / 1000), (unsigned long)(autoOffMs / 1000),
            promptOn ? 1 : 0, (unsigned)dimLevel, (unsigned)brightHigh,
-           (unsigned)gnssMode, 0u, (unsigned)outputChoice);
+           (unsigned)gnssMode, 0u, (unsigned)outputChoice, autoRec ? 1 : 0);
   f.print(b);
   f.close();
 }
@@ -1924,12 +1969,12 @@ static void handleSerialCmd() {
     else if (c == 'Z') {                   // restore factory defaults
       recIntervalS = 10; dimAfterMs = 30000u; autoOffMs = 90000u;
       brightHigh = 200; dimLevel = 12; promptOn = true;
-      gnssMode = 0; outputChoice = 0;
+      gnssMode = 0; outputChoice = 0; autoRec = false; autoRecStarted = false;
       saveSettings();
       sendGnssMode(gnssMode);
       M5.Display.setBrightness(dimmed ? dimLevel : brightHigh);
       setUiMode(UI_MAIN);
-      Serial.println("[SET] defaults restored 10s/pt dimAfter=30s off=90s bright=200 gnss=AUTO out=BROWSER");
+      Serial.println("[SET] defaults restored 10s/pt dimAfter=30s off=90s bright=200 gnss=AUTO out=BROWSER auto=0");
     }
     else if (c == 'G') {                   // IMU diagnostics
       float ax = 0, ay = 0, az = 0;
@@ -2124,9 +2169,27 @@ static void onKeyClick(int idx) {
       case 0: fileIndex = 0; fileTop = 0; setUiMode(UI_FILES);    break; // FILES
       case 1: setUiMode(UI_CAM);                                  break; // CAMERA
       case 2: settingsIndex = 0;          setUiMode(UI_SETTINGS); break; // SETUP
-      case 3: setUiMode(UI_OUTPUT);                              break; // OUTPUT
-      case 4: powerOffNow();                                      break; // POWEROFF
-      case 5: setUiMode(UI_MAIN);                                break; // EXIT
+      case 3: {                                                   // AUTO REC
+        autoRec = !autoRec;
+        if (!autoRec) autoRecStarted = false;
+        saveSettings();
+        appLog("[AUTO] %s", autoRec ? "on" : "off");
+        setStatus(autoRec ? "AUTO ON" : "AUTO OFF");
+        // 打开时若已拿到时间，立即开始，不必等下次开机
+        if (autoRec && !recording && !autoRecStarted && gps.timeValid && fsOk
+            && !lowBatLock) {
+          if (startRecording()) {
+            autoRecStarted = true;
+            setStatus("AUTO REC");
+            appLog("[REC] auto start (menu)");
+          }
+        }
+        drawMenuUI();
+        break;
+      }
+      case 4: setUiMode(UI_OUTPUT);                              break; // OUTPUT
+      case 5: powerOffNow();                                      break; // POWEROFF
+      case 6: setUiMode(UI_MAIN);                                break; // EXIT
     }
     return;
   }
@@ -2378,10 +2441,10 @@ void setup() {
     uint8_t wsrc = M5.In_I2C.readRegister8(0x6E, 0x05, 100000);
     uint8_t psrc = M5.In_I2C.readRegister8(0x6E, 0x04, 100000);
     uint8_t wdt  = M5.In_I2C.readRegister8(0x6E, 0x0A, 100000);
-    appLog("[BOOT] reason=%s(%d) heap=%u wake=05:%02X src=04:%02X wdt=0A:%02X bat=%dmV",
+    appLog("[BOOT] reason=%s(%d) heap=%u wake=05:%02X src=04:%02X wdt=0A:%02X bat=%dmV auto=%d",
              resetReasonName(bootReason), (int)bootReason,
              (unsigned)esp_get_free_heap_size(), wsrc, psrc, wdt,
-             (int)M5.Power.getBatteryVoltage());
+             (int)M5.Power.getBatteryVoltage(), autoRec ? 1 : 0);
   }
   cpuInit();                           // 电源计划：默认 80 MHz，操作时提速
 
@@ -2456,6 +2519,19 @@ void loop() {
     }
   }
   checkBattery();
+
+  // 自动记录：本次开机拿到 GPS 时间后自动开始一次（用户手动停止后不再重启）
+  if (autoRec && !autoRecStarted && !recording && !dumping && fsOk
+      && gps.timeValid && !lowBatLock) {
+    if (startRecording()) {
+      autoRecStarted = true;
+      setStatus("AUTO REC");
+      appLog("[REC] auto start (boot)");
+    } else {
+      autoRecStarted = true;   // 文件创建失败时不要每秒重试
+      appLog("[REC] auto start failed");
+    }
+  }
 
   // BLE 状态切换（连接/配对/写入）临时提速，完成后自然回落
   {
