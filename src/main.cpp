@@ -203,8 +203,8 @@ static HardwareSerial GPSSerial(2);
 
 #define GPScam_NAME "Sony Camera GPS Logger"
 #define GPScam_VER_MAJOR 4
-#define GPScam_VER_MINOR 6
-#define GPScam_VER_PATCH 3
+#define GPScam_VER_MINOR 7
+#define GPScam_VER_PATCH 0
 #define GPScam_VERSION_STR(maj, min, pat) \
   #maj "." #min "." #pat
 #define GPScam_VERSION_NO_V \
@@ -1083,13 +1083,24 @@ static void drawCpuBadge(void) {
   d.print(t);
 }
 
-// 电量剩余可用时间：电压计无法测电流，按 250 mAh 容量 / 典型 95 mA 折算，
-// 仅作量级参考。
+// 电量时间估算：没有电流计，按容量/典型电流折算，仅作量级参考。
+// 放电 250 mAh / 约 95 mA；充电 LGS4056H 为 190 mA 恒流 + CV 收尾，
+// 平均按 140 mA 估算到满时间。
 #define BAT_CAPACITY_MAH 250
 #define BAT_AVG_MA       95
-static void batteryRuntimeText(char *out, size_t n) {
+#define BAT_CHG_MA       140
+static void batteryRuntimeText(bool plugged, char *out, size_t n) {
+  if (plugged) {
+    if (batteryLevel >= 100) { snprintf(out, n, "FULL DONE"); return; }
+    if (batteryLevel <= 0)   { snprintf(out, n, "FULL --");   return; }
+    int mins = (int)((float)BAT_CAPACITY_MAH * (100 - batteryLevel) / 100.0f
+                     * 60.0f / BAT_CHG_MA);
+    if (mins < 1) mins = 1;
+    if (mins >= 60) snprintf(out, n, "FULL %dh%02dm", mins / 60, mins % 60);
+    else            snprintf(out, n, "FULL %dm", mins);
+    return;
+  }
   if (batteryLevel <= 0) { snprintf(out, n, "LEFT --"); return; }
-  if (M5.Power.getVBUSVoltage() > 4000) { snprintf(out, n, "LEFT CHG"); return; }
   int mins = (int)((float)BAT_CAPACITY_MAH * batteryLevel / 100.0f * 60.0f / BAT_AVG_MA);
   if (mins >= 60) snprintf(out, n, "LEFT %dh%02dm", mins / 60, mins % 60);
   else            snprintf(out, n, "LEFT %dm", mins);
@@ -1208,9 +1219,9 @@ static void drawMainPortrait() {
     bool full = (batteryLevel >= 100);
     drawChargingText(plugged, full);
     drawCpuBadge();
-    // 下一行：剩余可用时间估算
-    batteryRuntimeText(b, sizeof(b));
-    putRow(P_BATRUN, TFT_DARKGREY, b);
+    // 下一行：放电=剩余可用时间；充电=预计充满时间
+    batteryRuntimeText(plugged, b, sizeof(b));
+    putRow(P_BATRUN, plugged ? TFT_GREEN : TFT_DARKGREY, b);
   }
 
   // P_FREE / P_FILES: storage stats split over two lines.
