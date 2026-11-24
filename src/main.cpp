@@ -205,7 +205,7 @@ static HardwareSerial GPSSerial(2);
 #define GPScam_NAME "Sony Camera GPS Logger"
 #define GPScam_VER_MAJOR 4
 #define GPScam_VER_MINOR 9
-#define GPScam_VER_PATCH 2
+#define GPScam_VER_PATCH 3
 #define GPScam_VERSION_STR(maj, min, pat) \
   #maj "." #min "." #pat
 #define GPScam_VERSION_NO_V \
@@ -1464,7 +1464,8 @@ static void drawFilesUI() {
           (nm[L - 1] == 'x' || nm[L - 1] == 'X')) {
         nm[L - 4] = 0;
       }
-      snprintf(b, sizeof(b), "%s", nm);
+      // 4.9.3: 行首序号（仅显示，不写入文件名），方便翻找
+      snprintf(b, sizeof(b), "%02d %s", row + 1, nm);
     } else if (row == fileCount) {
       snprintf(b, sizeof(b), "全部删除");   // 三次确认
     } else {

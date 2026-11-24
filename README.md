@@ -17,7 +17,7 @@ M5StickS3 + M5 Unit GPS 1.1 二合一固件：**GPX 轨迹记录** + **索尼相
   - 支持多台相机同时连接
   - 开机自动连接已保存的相机
 - **相机管理**：扫描添加 / 设备管理（连接、忘记）/ 已配对列表持久化（NVS）
-- **文件管理**：轨迹列表支持单条删除与「全部删除」（三次确认）
+- **文件管理**：轨迹列表带序号（仅显示，不写入文件名），支持单条删除与「全部删除」（三次确认）
 - **UI**：135×240 竖屏中文界面；菜单全中文；所有 EXIT 返回上一级
 - **BLE 名称**：`sony-gps-XXXX`（XXXX 由芯片 MAC 派生，每台唯一）
 - **电源计划**：空闲/记录 80 MHz，按键与 BLE 操作临时 240 MHz，20 秒回落
@@ -45,7 +45,7 @@ pio run -e sticks3
 
 **方式一：单文件（最简单，会清空 NVS 配对）**
 
-Release 中的 `SonyGPS-4.9.2-flash-kit.zip` 已包含单文件固件与一键脚本：
+Release 中的 `SonyGPS-4.9.3-flash-kit.zip` 已包含单文件固件与一键脚本：
 
 ```bash
 ./flash-macos.sh            # macOS / Linux，自动找串口
@@ -55,7 +55,7 @@ flash-windows.bat COM3      # Windows
 等价命令：
 
 ```bash
-esptool --chip esp32s3 --port <PORT> write-flash 0x0 sony-gps-logger-4.9.2.bin
+esptool --chip esp32s3 --port <PORT> write-flash 0x0 sony-gps-logger-4.9.3.bin
 ```
 
 > 单文件从 0x0 整片写入，NVS 会被清空：**已保存的相机会丢失，需要重新配对**。

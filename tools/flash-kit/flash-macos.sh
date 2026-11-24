@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Sony GPS Logger 4.9.2 单文件刷机（macOS / Linux）
+# Sony GPS Logger 4.9.3 单文件刷机（macOS / Linux）
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
-BIN="$DIR/sony-gps-logger-4.9.2.bin"
+BIN="$DIR/sony-gps-logger-4.9.3.bin"
 PORT="${1:-}"
 if [ -z "$PORT" ]; then
   PORT="$(ls /dev/cu.usbmodem* /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -n1 || true)"
