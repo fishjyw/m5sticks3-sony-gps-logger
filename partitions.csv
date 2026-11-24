@@ -1,0 +1,5 @@
+# 与用户 v3.2.0 相同的布局：3MB app + ~4.9MB LittleFS
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+factory,  app,  factory, 0x10000,  0x300000,
+spiffs,   data, spiffs,  0x310000, 0x4F0000,

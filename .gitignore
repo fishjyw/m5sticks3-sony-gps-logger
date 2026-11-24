@@ -1,0 +1,12 @@
+# PlatformIO / ESP-IDF build output
+.pio/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+build/
+
+# IDE / OS noise
+.DS_Store
+.vscode/
+*.swp
