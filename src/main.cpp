@@ -204,7 +204,7 @@ static HardwareSerial GPSSerial(2);
 #define GPScam_NAME "Sony Camera GPS Logger"
 #define GPScam_VER_MAJOR 4
 #define GPScam_VER_MINOR 7
-#define GPScam_VER_PATCH 0
+#define GPScam_VER_PATCH 1
 #define GPScam_VERSION_STR(maj, min, pat) \
   #maj "." #min "." #pat
 #define GPScam_VERSION_NO_V \
@@ -1830,6 +1830,16 @@ static void handleSerialCmd() {
                     (unsigned)(esp_clk_cpu_freq() / 1000000), (unsigned)rc.freq_mhz,
                     (int)rc.source, (unsigned)rc.div, (unsigned)cpuMhzNow,
                     pmReady ? 1 : 0);
+      {
+        uint8_t r06 = M5.In_I2C.readRegister8(0x6E, 0x06, 100000);
+        uint8_t r07 = M5.In_I2C.readRegister8(0x6E, 0x07, 100000);
+        uint8_t r08 = M5.In_I2C.readRegister8(0x6E, 0x08, 100000);
+        uint8_t r49 = M5.In_I2C.readRegister8(0x6E, 0x49, 100000);
+        uint8_t r4A = M5.In_I2C.readRegister8(0x6E, 0x4A, 100000);
+        uint8_t r0C = M5.In_I2C.readRegister8(0x6E, 0x0C, 100000);
+        Serial.printf("[PMIC] pwr=06:%02X hold=07:%02X lvp=08:%02X btn1=49:%02X btn2=4A:%02X sys=0C:%02X\n",
+                      r06, r07, r08, r49, r4A, r0C);
+      }
       FILE *f = fopen("/littlefs/pm.txt", "w");
       if (f) {
         esp_pm_dump_locks(f);
@@ -2190,6 +2200,20 @@ static uint32_t probeBaud(int rxPin, int txPin, uint32_t baud, uint32_t ms) {
   return dollars;
 }
 
+// PMIC（M5PM1, 0x6E）按钮配置：默认双击关机是关闭的，且这个设置可能被
+// 以前的固件（如 furble）置位后一直保存在 PMIC 里，ESP32 重新刷机也不会
+// 恢复。这里在开机时显式打开双击关机（0x4A bit0 = 0）。
+static void pmicEnableDoubleOff(void) {
+  const uint8_t cfg2 = M5.In_I2C.readRegister8(0x6E, 0x4A, 100000);
+  if (cfg2 & 0x01) {
+    M5.In_I2C.writeRegister8(0x6E, 0x4A, (uint8_t)(cfg2 & ~0x01), 100000);
+    Serial.printf("[PMIC] double-click power off enabled (4A %02X -> %02X)\n",
+                  cfg2, cfg2 & ~0x01);
+  } else {
+    Serial.println("[PMIC] double-click power off already enabled");
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -2232,6 +2256,7 @@ void setup() {
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextWrap(false);
   Serial.println("[LOG] M5 up");
+  pmicEnableDoubleOff();          // 恢复电源键双击关机
   {
     const char *rn = "OTHER";
     switch (bootReason) {
