@@ -157,6 +157,12 @@ class Camera: public NimBLEClientCallbacks {
   virtual void _disconnect(void) = 0;
 
   /**
+   * 断开并释放底层 BLE client（可重复调用）。之前依赖 NimBLE 的
+   * self-delete，连接失败后指针悬空，后续 disconnect 会踩空崩溃。
+   */
+  void closeClient(void);
+
+  /**
    * BLE security IO capability for this camera type.
    *
    * @return the IO capability to advertise during pairing.

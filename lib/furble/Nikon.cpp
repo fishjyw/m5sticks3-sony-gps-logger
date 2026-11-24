@@ -124,7 +124,7 @@ bool Nikon::_connect(void) {
 }
 
 void Nikon::_disconnect(void) {
-  m_Client->disconnect();
+  closeClient();
 }
 
 void Nikon::shutterPress(void) {

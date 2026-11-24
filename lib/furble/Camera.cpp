@@ -8,6 +8,12 @@ Camera::Camera(Type type, PairType pairType) : m_PairType(pairType), m_Type(type
 
 Camera::~Camera() {
   m_Connected = false;
+  closeClient();
+}
+
+void Camera::closeClient(void) {
+  if (m_Client == nullptr) return;
+  NimBLEDevice::deleteClient(m_Client);
   m_Client = nullptr;
 }
 
@@ -36,7 +42,7 @@ bool Camera::connect(esp_power_level_t power, uint32_t timeout) {
   }
 
   m_Client->setClientCallbacks(this, false);
-  m_Client->setSelfDelete(true, true);  // self-delete on any connection failure
+  m_Client->setSelfDelete(false, false);  // 由 closeClient() 统一释放
 
   // adjust connection timeout and parameters
   m_Client->setConnectTimeout(timeout);

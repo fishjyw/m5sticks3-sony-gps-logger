@@ -113,6 +113,7 @@
  */
 
 #include "compat.h"
+#include "applog.h"
 #include <M5Unified.h>
 #include <esp_log.h>
 #include <esp_pm.h>
@@ -203,8 +204,8 @@ static HardwareSerial GPSSerial(2);
 
 #define GPScam_NAME "Sony Camera GPS Logger"
 #define GPScam_VER_MAJOR 4
-#define GPScam_VER_MINOR 7
-#define GPScam_VER_PATCH 3
+#define GPScam_VER_MINOR 8
+#define GPScam_VER_PATCH 0
 #define GPScam_VERSION_STR(maj, min, pat) \
   #maj "." #min "." #pat
 #define GPScam_VERSION_NO_V \
@@ -564,15 +565,19 @@ static bool initFS() {
   return true;
 }
 
-// 事件日志：只记录开机原因、录制起停、BLE 状态等关键点，用于事后判断
-// 是崩溃重启、看门狗还是断电。超过 16 KB 时清空重来。
-static void eventLog(const char *fmt, ...) {
+// 系统日志（固定区域）：写入 /syslog.txt，32 KB 一段，滚动保留上一段
+// /syslog.1.txt，总量不超过 64 KB，与 GPX 数据分开。记录开机原因、
+// 录制起停、BLE 状态、相机页每一步操作，用于事后定位卡死/重启。
+void appLog(const char *fmt, ...) {
   if (!fsOk) return;
-  File ck = LittleFS.open("/events.log");
+  File ck = LittleFS.open("/syslog.txt");
   size_t sz = ck ? ck.size() : 0;
   ck.close();
-  if (sz > 16384) LittleFS.remove("/events.log");
-  File f = LittleFS.open("/events.log", "a");
+  if (sz > 32768) {
+    LittleFS.remove("/syslog.1.txt");
+    rename("/littlefs/syslog.txt", "/littlefs/syslog.1.txt");
+  }
+  File f = LittleFS.open("/syslog.txt", "a");
   if (!f) return;
   char b[160];
   va_list ap;
@@ -742,7 +747,7 @@ static bool startRecording() {
   trackPoints = 0;
   recStartSecs = gpsEpochSecs(gps);
   recording = true;
-  eventLog("[REC] start %s heap=%u", trackName, (unsigned)esp_get_free_heap_size());
+  appLog("[REC] start %s heap=%u", trackName, (unsigned)esp_get_free_heap_size());
   return true;
 }
 static void stopRecording() {
@@ -750,7 +755,7 @@ static void stopRecording() {
   trackFile.print("</trkseg></trk></gpx>\n");
   trackFile.flush();
   trackFile.close();
-  eventLog("[REC] stop %s pts=%u heap=%u", trackName, (unsigned)trackPoints,
+  appLog("[REC] stop %s pts=%u heap=%u", trackName, (unsigned)trackPoints,
            (unsigned)esp_get_free_heap_size());
   recording = false;
 }
@@ -1754,7 +1759,7 @@ static void checkBattery() {
     if (++lowBatHits >= 2) {                 // 2 checks x 10 s, avoid spikes
       lowBatHits = 0;
       lowBatLock = true;
-      eventLog("[REC] low-battery stop bat=%d", batteryLevel);
+      appLog("[REC] low-battery stop bat=%d", batteryLevel);
       stopRecording();
       countFilesCache = -1;
       setStatus("LOW BAT - REC STOPPED");
@@ -1815,16 +1820,19 @@ static void handleSerialCmd() {
       fileLogSuspend(false);
     }
     else if (c == 'L') { listGpx(); }
-    else if (c == 'K') {                   // 导出 /events.log（开机/录制/蓝牙事件）
-      File ef = LittleFS.open("/events.log");
-      Serial.println("#EVENTS_BEGIN");
-      if (ef) {
+    else if (c == 'K') {                   // 导出系统日志（上一段 + 当前段）
+      Serial.println("#SYSLOG_BEGIN");
+      const char *files[2] = {"/syslog.1.txt", "/syslog.txt"};
+      for (int fi = 0; fi < 2; fi++) {
+        File ef = LittleFS.open(files[fi]);
+        if (!ef) continue;
+        Serial.printf("#SYSLOG_FILE|%s\n", files[fi]);
         uint8_t eb[256];
         int got;
         while ((got = ef.read(eb, sizeof(eb))) > 0) Serial.write(eb, got);
         ef.close();
       }
-      Serial.println("#EVENTS_END");
+      Serial.println("#SYSLOG_END");
     }
     else if (c == 'T') { makeTestGpx(); }
     else if (c == 'X') { cleanTestGpx(); }
@@ -2199,7 +2207,7 @@ static void manageSelectTimeout() {
 
 // Graceful shutdown: close GPX, then ask M5PM1 to cut L2/L3 power.
 static void powerOffNow() {
-  eventLog("[PWR] off rec=%d autoOff=%d bat=%d", recording ? 1 : 0,
+  appLog("[PWR] off rec=%d autoOff=%d bat=%d", recording ? 1 : 0,
            autoOffReason ? 1 : 0, batteryLevel);
   if (recording) stopRecording();
   if (exportMode) exitExportScreen();
@@ -2359,6 +2367,7 @@ void setup() {
   keys[0].downMs = keys[1].downMs = millis();
 
   initFS();
+  if (fsOk && LittleFS.exists("/events.log")) LittleFS.remove("/events.log");  // 旧日志迁移
   fileLogInstall();                    // 日志同时写入 /debug.log（离线排障用）
   Serial.printf("[LOG] FS %s, free=%u bytes\n",
                 fsOk ? "OK" : "FAIL",
@@ -2369,7 +2378,7 @@ void setup() {
     uint8_t wsrc = M5.In_I2C.readRegister8(0x6E, 0x05, 100000);
     uint8_t psrc = M5.In_I2C.readRegister8(0x6E, 0x04, 100000);
     uint8_t wdt  = M5.In_I2C.readRegister8(0x6E, 0x0A, 100000);
-    eventLog("[BOOT] reason=%s(%d) heap=%u wake=05:%02X src=04:%02X wdt=0A:%02X bat=%dmV",
+    appLog("[BOOT] reason=%s(%d) heap=%u wake=05:%02X src=04:%02X wdt=0A:%02X bat=%dmV",
              resetReasonName(bootReason), (int)bootReason,
              (unsigned)esp_get_free_heap_size(), wsrc, psrc, wdt,
              (int)M5.Power.getBatteryVoltage());
@@ -2456,7 +2465,7 @@ void loop() {
       static uint32_t lastBleLog = 0;   // 连接重试时状态会反复跳，限流写 flash
       if (millis() - lastBleLog >= 5000) {
         lastBleLog = millis();
-        eventLog("[BLE] state %d heap=%u", (int)ctl, (unsigned)esp_get_free_heap_size());
+        appLog("[BLE] state %d heap=%u", (int)ctl, (unsigned)esp_get_free_heap_size());
       }
       if (ctl == Furble::Control::STATE_CONNECTING ||
           ctl == Furble::Control::STATE_CONNECT ||

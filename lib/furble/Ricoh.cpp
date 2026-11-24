@@ -284,8 +284,7 @@ bool Ricoh::_connect(void) {
 
 void Ricoh::_disconnect(void) {
   clearRemoteState();
-  if (m_Client != nullptr && m_Client->isConnected())
-    m_Client->disconnect();
+  closeClient();
 }
 
 void Ricoh::clearRemoteState(void) {

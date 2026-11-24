@@ -10,6 +10,7 @@
  * 导航：MID=下移 FRONT=确定 MID长按=返回上一级 FRONT长按=清除全部配对
  */
 #include "CameraPage.h"
+#include "applog.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -51,9 +52,13 @@ static bool s_confirmForget = false;
 static uint32_t s_forgetMs = 0;
 static uint32_t s_failMs = 0;
 
-// 进入设备管理前需要等连接线程释放 Camera* 引用，用非阻塞状态机代替忙等
-static bool s_mgmtWait = false;
-static uint32_t s_mgmtWaitMs = 0;
+// 进入添加/管理/清配对前都要先断开，等 Control 线程释放 Camera* 引用后
+// 才能销毁列表，否则连接重试中的线程会踩到已释放对象（LoadProhibited）。
+enum class Pending { NONE, ADD, MGMT, CLEAR };
+static Pending  s_pending = Pending::NONE;
+static uint32_t s_pendingMs = 0;
+
+static bool busy(void) { return s_pending != Pending::NONE; }
 
 static char s_snap[512];
 
@@ -143,24 +148,6 @@ static int itemCount(void) {
   return (int)CameraList::size();
 }
 
-// 进入设备管理：先断开，等 Control 释放 Camera* 引用后再销毁列表。
-// 不在这里忙等，避免 UI 卡顿 —— 由 tick() 完成余下的列表重建。
-static void beginMgmt(void) {
-  s_page = Page::MGMT;
-  s_cursor = 0;
-  auto &ctl = Control::getInstance();
-  if (ctl.getState() != Control::STATE_IDLE) {
-    ctl.disconnect();
-    s_mgmtWait = true;
-    s_mgmtWaitMs = millis();
-  } else {
-    s_mgmtWait = false;
-    CameraList::clear();
-    CameraList::load();
-  }
-  s_dirty = true;
-}
-
 // 扫描前确保没有挂起的连接（否则 BLE 栈并发卡死）
 static void ensureNoPendingConnect(void) {
   auto st = Control::getInstance().getState();
@@ -180,11 +167,11 @@ static void startScan(void) {
       },
       nullptr);
   s_state = CamState::SCANNING;
+  appLog("[CAM] scan started");
   s_dirty = true;
 }
 
-static void doClear(void) {
-  Control::getInstance().disconnect();
+static void doClearNow(void) {
   Scan::getInstance().stop();
   CameraList::clear();
   CameraList::load();
@@ -195,8 +182,50 @@ static void doClear(void) {
   }
   NimBLEDevice::deleteAllBonds();
   Serial.println("[CAM] pairings + bonds cleared");
+  appLog("[CAM] pairings cleared");
   s_confirmClear = false;
   s_state = CamState::IDLE;
+  s_dirty = true;
+}
+
+static void runPending(void) {
+  Pending p = s_pending;
+  s_pending = Pending::NONE;
+  switch (p) {
+    case Pending::ADD:
+      s_page = Page::ADD;
+      s_cursor = 0;
+      CameraList::clear();
+      startScan();
+      appLog("[CAM] add-device ready");
+      break;
+    case Pending::MGMT:
+      s_page = Page::MGMT;
+      s_cursor = 0;
+      CameraList::clear();
+      CameraList::load();
+      appLog("[CAM] mgmt ready (%d)", itemCount());
+      break;
+    case Pending::CLEAR:
+      doClearNow();
+      break;
+    default:
+      break;
+  }
+  s_dirty = true;
+}
+
+// 先请求断开；Control 回到 IDLE（或 3 秒超时）后才销毁列表。
+static void requestPending(Pending p) {
+  s_pending = p;
+  s_pendingMs = millis();
+  appLog("[CAM] pending=%d", (int)p);
+  auto &ctl = Control::getInstance();
+  if (ctl.getState() != Control::STATE_IDLE) {
+    ctl.disconnect();
+  } else {
+    runPending();
+  }
   s_dirty = true;
 }
 
@@ -236,7 +265,7 @@ static void forgetOne(void) {
 static const char *statusLabel(void) {
   auto st = Control::getInstance().getState();
   static char b[48];
-  if (s_mgmtWait) return "断开中...";
+  if (busy()) return "断开中...";
   if (s_confirmClear) return "清配对? 是/否";
   if (s_confirmForget) return "忘记? 是/否";
   if (s_page == Page::DEVICE) {
@@ -407,10 +436,10 @@ void enter(void) {
   s_page = Page::MENU;
   s_cursor = 0;
   s_exitReq = false;
-  s_mgmtWait = false;
+  s_pending = Pending::NONE;
   s_snap[0] = 0;
   s_dirty = true;
-  Serial.println("[CAM] menu entered");
+  appLog("[CAM] menu entered");
 }
 
 void leave(void) {
@@ -425,13 +454,10 @@ void draw(void) {
 bool tick(uint32_t now) {
   auto st = Control::getInstance().getState();
 
-  // 设备管理：等待断连完成后重建列表（非阻塞，最多等 800 ms）
-  if (s_mgmtWait && (st == Control::STATE_IDLE || now - s_mgmtWaitMs > 800)) {
-    s_mgmtWait = false;
-    CameraList::clear();
-    CameraList::load();
-    s_dirty = true;
-    Serial.printf("[CAM] mgmt list rebuilt, %d saved\n", (int)CameraList::size());
+  // 挂起操作：等 Control 释放 Camera* 引用后执行（最多等 3 s）
+  if (s_pending != Pending::NONE &&
+      (st == Control::STATE_IDLE || now - s_pendingMs > 3000)) {
+    runPending();
   }
   if (st == Control::STATE_ACTIVE && s_state != CamState::ACTIVE) {
     s_state = CamState::ACTIVE;
@@ -473,9 +499,9 @@ bool tick(uint32_t now) {
 }
 
 void front(void) {
-  if (s_mgmtWait) return;  // 等列表就绪后再接受操作
+  if (busy()) return;  // 等断开完成、列表就绪后再接受操作
   if (s_confirmClear) {
-    doClear();
+    requestPending(Pending::CLEAR);
     return;
   }
   if (s_confirmForget) {
@@ -488,16 +514,9 @@ void front(void) {
   switch (s_page) {
     case Page::MENU:
       if (s_cursor == 0) {  // ADD DEVICE
-        ensureNoPendingConnect();
-        s_page = Page::ADD;
-        s_cursor = 0;
-        CameraList::clear();
-        Serial.println("[CAM] add device page, scanning");
-        startScan();
+        requestPending(Pending::ADD);
       } else if (s_cursor == 1) {  // DEVICE MANAGEMENT
-        beginMgmt();
-        Serial.printf("[CAM] mgmt page, %d saved, wait=%d\n", itemCount(),
-                      s_mgmtWait ? 1 : 0);
+        requestPending(Pending::MGMT);
       } else {  // EXIT
         s_exitReq = true;
       }
@@ -507,8 +526,7 @@ void front(void) {
     case Page::ADD: {
       if (n == 0) {
         if (s_cursor == 0) {  // RESCAN
-          ensureNoPendingConnect();
-          startScan();
+          requestPending(Pending::ADD);
         } else {              // EXIT
           Scan::getInstance().stop();
           s_page = Page::MENU;
@@ -520,9 +538,7 @@ void front(void) {
       if (s_cursor < n) {
         connectOne(s_cursor);
       } else if (s_cursor == n) {  // RESCAN
-        ensureNoPendingConnect();
-        CameraList::clear();
-        startScan();
+        requestPending(Pending::ADD);
       } else {                     // EXIT
         Scan::getInstance().stop();
         s_page = Page::MENU;
@@ -563,7 +579,7 @@ void front(void) {
 }
 
 void mid(void) {
-  if (s_mgmtWait) return;
+  if (busy()) return;
   if (s_confirmClear) { s_confirmClear = false; s_dirty = true; return; }
   if (s_confirmForget) { s_confirmForget = false; s_dirty = true; return; }
 
@@ -580,11 +596,12 @@ void mid(void) {
 }
 
 void back(void) {
-  if (s_mgmtWait) {  // 等待期间允许取消
-    s_mgmtWait = false;
+  if (busy()) {  // 等待断开期间允许取消
+    s_pending = Pending::NONE;
     s_page = Page::MENU;
     s_cursor = 0;
     s_dirty = true;
+    appLog("[CAM] pending cancelled");
     return;
   }
   if (s_confirmClear) { s_confirmClear = false; s_dirty = true; return; }
@@ -620,7 +637,7 @@ void requestClear(void) {
 }
 
 void clearPairings(void) {
-  doClear();
+  requestPending(Pending::CLEAR);
 }
 
 void getLinkInfo(LinkInfo &o) {
