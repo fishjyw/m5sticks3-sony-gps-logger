@@ -205,7 +205,7 @@ static HardwareSerial GPSSerial(2);
 #define GPScam_NAME "Sony Camera GPS Logger"
 #define GPScam_VER_MAJOR 4
 #define GPScam_VER_MINOR 9
-#define GPScam_VER_PATCH 1
+#define GPScam_VER_PATCH 2
 #define GPScam_VERSION_STR(maj, min, pat) \
   #maj "." #min "." #pat
 #define GPScam_VERSION_NO_V \
@@ -292,7 +292,7 @@ static int       exportDoneCount = 0;   // 上次导出文件数（导出页显�
 // ---------------- display / menu / idle state ----------------
 // v1.1.0: the horizontal bottom menu bar was replaced by a full-screen
 // MENU sub page (MID enters it from the main screen, FRONT confirms).
-enum UiMode : uint8_t { UI_MAIN = 0, UI_MENU, UI_FILES, UI_SETTINGS, UI_DELETE, UI_OUTPUT, UI_CAM, UI_EXPORT };
+enum UiMode : uint8_t { UI_MAIN = 0, UI_MENU, UI_FILES, UI_SETTINGS, UI_DELETE, UI_DELALL, UI_OUTPUT, UI_CAM, UI_EXPORT };
 static UiMode   uiMode = UI_MAIN;
 static int      menuIndex = 0;         // cursor in MENU_LABELS (menu sub page)
 static uint32_t selectEnterMs = 0;    // last REAL key press in a select page
@@ -324,6 +324,8 @@ static int      fileTop   = 0;         // scroll offset
 static int      deleteChoice = 0;      // 0 = DELETE, 1 = CANCEL
 static bool     delArmed = false;      // DELETE 二次确认
 static uint32_t delArmedMs = 0;
+// 全部删除：需要三次确认（0 未确认，1 已确认一次，2 已确认两次）
+static int      delAllStage = 0;
 
 // Runtime settings: defaults from the macros, editable in SETUP, persisted
 // in /settings.cfg so they survive a reboot.
@@ -1418,7 +1420,7 @@ static void collectFiles() {
     }
     memcpy(fileNames[j + 1], tmp, sizeof(tmp));
   }
-  int rows = fileCount + 1;              // files + EXIT
+  int rows = fileCount + 2;              // files + 全部删除 + EXIT
   if (fileIndex >= rows) fileIndex = rows - 1;
   if (fileIndex < 0)     fileIndex = 0;
   fileRowsVisible = FILE_ROWS_P;
@@ -1442,7 +1444,7 @@ static void drawFilesUI() {
     snprintf(b, sizeof(b), "FREE %dKB", freeKB);
     uiText(4, 24, b, TFT_SILVER);
   }
-  int rows = fileCount + 1;
+  int rows = fileCount + 2;              // 文件 + 全部删除 + 退出
   const int pitch = 26;
   const int y0    = 42;
   for (int i = 0; i < fileRowsVisible; i++) {
@@ -1463,8 +1465,10 @@ static void drawFilesUI() {
         nm[L - 4] = 0;
       }
       snprintf(b, sizeof(b), "%s", nm);
+    } else if (row == fileCount) {
+      snprintf(b, sizeof(b), "全部删除");   // 三次确认
     } else {
-      snprintf(b, sizeof(b), "退出");     // last row = back to parent menu
+      snprintf(b, sizeof(b), "退出");       // last row = back to parent menu
     }
     uiSelectRow(2, y, 131, b, row == fileIndex);
   }
@@ -1498,6 +1502,50 @@ static void doDelete() {
   countFilesCache = -1;
   collectFiles();
   setUiMode(UI_FILES);          // back to the (refreshed) list
+}
+
+// 全部删除确认页：stage=已确认次数（0..2），第 3 次 FRONT 才真正删除
+static void drawDeleteAllUI() {
+  auto &d = M5.Display;
+  useAsciiFont();
+  d.fillScreen(TFT_BLACK);
+  uiText(4, 2, "删除全部轨迹?", TFT_YELLOW, TFT_BLACK, 2);
+  char b[32];
+  snprintf(b, sizeof(b), "共 %d 个文件", fileCount);
+  uiText(4, 30, b, TFT_WHITE);
+  uiSelectRowP(4,  70, "删除", deleteChoice == 0);
+  uiSelectRowP(4, 106, "取消", deleteChoice == 1);
+  const char *hint = (delAllStage == 0) ? "需连续确认三次"
+                   : (delAllStage == 1) ? "确认 2/3"
+                                        : "最后确认 3/3";
+  uiText(4, 150, hint, TFT_RED);
+  clearRowCache();
+  Serial.printf("[DEL] delete-all draw stage=%d choice=%d\n", delAllStage,
+                deleteChoice);
+}
+
+static void doDeleteAll() {
+  if (recording) stopRecording();      // 正在录制先收尾，避免删除已打开的文件
+  int removed = 0;
+  for (int pass = 0; pass < 64; pass++) {   // 每轮最多 24 个，最多 1536 个文件
+    collectFiles();
+    if (fileCount == 0) break;
+    bool any = false;
+    int n = fileCount;
+    for (int i = 0; i < n; i++) {
+      if (LittleFS.remove(fileNames[i])) removed++;
+      any = true;
+    }
+    if (!any) break;
+  }
+  countFilesCache = -1;
+  collectFiles();
+  fileIndex = 0;
+  fileTop = 0;
+  appLog("[FILES] delete all removed=%d", removed);
+  Serial.printf("[DEL] delete all removed=%d\n", removed);
+  setStatus("ALL DELETED");
+  setUiMode(UI_FILES);
 }
 
 // ---------------- SETUP page: English labels + graphical sliders ----------------
@@ -1629,6 +1677,7 @@ static void setUiMode(UiMode m) {
     case UI_FILES:    collectFiles(); drawFilesUI();     break;
     case UI_SETTINGS: drawSettingsUI();                  break;
     case UI_DELETE:   drawDeleteUI();                    break;
+    case UI_DELALL:   drawDeleteAllUI();                 break;
     case UI_OUTPUT:   outputIndex = outputChoice; drawOutputUI(); break;
     case UI_CAM:      FurbCam::enter(); FurbCam::draw();       break;
     case UI_EXPORT:   drawExportPage();                        break;
@@ -2011,6 +2060,18 @@ static void handleSerialCmd() {
     else if (c == 'V') {                   // font / UI sanity
       Serial.printf("[UI] font=Font0 ascii-only mode=%d\n", (int)uiMode);
     }
+    else if (c == 'Q') {                   // 测试钩子：直接打开文件列表
+      collectFiles();
+      setUiMode(UI_FILES);
+      Serial.printf("[TEST] files page, %d files\n", fileCount);
+    }
+    else if (c == 'Y') {                   // 测试钩子：打开"全部删除"确认页
+      collectFiles();
+      deleteChoice = 1;
+      delAllStage = 0;
+      setUiMode(UI_DELALL);
+      Serial.printf("[TEST] delete-all page, %d files\n", fileCount);
+    }
     else if (c == 'F') {          // headless regression for the wake banner
       dimmed = true;
       M5.Display.setBrightness(dimLevel);
@@ -2156,11 +2217,15 @@ static void onKeyClick(int idx) {
       menuIndex = (menuIndex + 1) % MENU_COUNT;
       drawMenuUI();
     } else if (uiMode == UI_FILES) {
-      int rows = fileCount + 1;                 // files + trailing EXIT
+      int rows = fileCount + 2;                 // 文件 + 全部删除 + 退出
       fileIndex = (fileIndex + 1) % rows;
       if (fileIndex < fileTop) fileTop = fileIndex;
       if (fileIndex >= fileTop + FILE_ROWS_P) fileTop = fileIndex - FILE_ROWS_P + 1;
       drawFilesUI();
+    } else if (uiMode == UI_DELALL) {
+      deleteChoice = 1 - deleteChoice;          // 切换后重新从第 1 次确认开始
+      delAllStage = 0;
+      drawDeleteAllUI();
     } else if (uiMode == UI_SETTINGS) {
       settingsIndex = (settingsIndex + 1) % SETUP_COUNT;
       drawSettingsUI();
@@ -2212,8 +2277,27 @@ static void onKeyClick(int idx) {
     return;
   }
   if (uiMode == UI_FILES) {
-    if (fileIndex >= fileCount) setUiMode(UI_MENU);   // EXIT -> 返回菜单
-    else { deleteChoice = 1; delArmed = false; setUiMode(UI_DELETE); }  // 默认 CANCEL，防误删
+    if (fileIndex < fileCount) {
+      deleteChoice = 1; delArmed = false; setUiMode(UI_DELETE);   // 默认 CANCEL，防误删
+    } else if (fileIndex == fileCount) {
+      deleteChoice = 1; delAllStage = 0; setUiMode(UI_DELALL);    // 全部删除：三次确认
+    } else {
+      setUiMode(UI_MENU);                                        // EXIT -> 返回菜单
+    }
+    return;
+  }
+  if (uiMode == UI_DELALL) {
+    if (deleteChoice == 0) {
+      delAllStage++;
+      if (delAllStage >= 3) {
+        doDeleteAll();                 // 第 3 次确认
+      } else {
+        drawDeleteAllUI();
+      }
+    } else {
+      delAllStage = 0;
+      setUiMode(UI_FILES);
+    }
     return;
   }
   if (uiMode == UI_DELETE) {
@@ -2477,6 +2561,7 @@ void setup() {
       NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RPA_RANDOM_DEFAULT);
       Serial.printf("[BLE] identity %02X:%02X:%02X:%02X:%02X:%02X\n", id[5], id[4], id[3],
                     id[2], id[1], id[0]);
+      Serial.printf("[BLE] name %s\n", Furble::Device::getStringID().c_str());
     }
     xTaskCreate(control_task, "control", 12288, &Furble::Control::getInstance(), 4, NULL);
     if (Furble::CameraList::getSaveCount() > 0) {

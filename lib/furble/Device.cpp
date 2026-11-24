@@ -28,14 +28,16 @@ uint64_t Device::getEfuseMac(void) {
 }
 
 void Device::init(esp_power_level_t power) {
-  uint32_t chip_id = (uint32_t)getEfuseMac();
+  uint64_t mac = getEfuseMac();
+  uint32_t chip_id = (uint32_t)mac;
   for (size_t i = 0; i < UUID128_AS_32_LEN; i++) {
     chip_id = xorshift(chip_id);
     m_Uuid.uint32[i] = chip_id;
   }
 
-  // truncate ID to 5 hex characters (arbitrary, just make it 'nice' to read)
-  snprintf(m_StringID, DEVICE_ID_STR_MAX, "%s-%05lx", FURBLE_STR, m_Uuid.uint32[0] & 0xFFFFF);
+  // 4.9.2: BLE 名称固定为 sony-gps-XXXX，XXXX 取 MAC 低 16 位
+  // （每台设备唯一、可复现，不随开机变化）
+  snprintf(m_StringID, DEVICE_ID_STR_MAX, "sony-gps-%04X", (unsigned)(mac & 0xFFFF));
 
   m_ID = std::string(m_StringID);
 

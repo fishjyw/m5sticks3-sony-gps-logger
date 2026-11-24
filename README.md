@@ -17,7 +17,9 @@ M5StickS3 + M5 Unit GPS 1.1 二合一固件：**GPX 轨迹记录** + **索尼相
   - 支持多台相机同时连接
   - 开机自动连接已保存的相机
 - **相机管理**：扫描添加 / 设备管理（连接、忘记）/ 已配对列表持久化（NVS）
+- **文件管理**：轨迹列表支持单条删除与「全部删除」（三次确认）
 - **UI**：135×240 竖屏中文界面；菜单全中文；所有 EXIT 返回上一级
+- **BLE 名称**：`sony-gps-XXXX`（XXXX 由芯片 MAC 派生，每台唯一）
 - **电源计划**：空闲/记录 80 MHz，按键与 BLE 操作临时 240 MHz，20 秒回落
 - **电量**：电压曲线换算 + 平滑 + 充电补偿；显示百分比、CHG 状态、剩余可用时间，充电时显示预计充满时间
 
@@ -41,7 +43,25 @@ pio run -e sticks3
 
 ### 刷机
 
-**必须分区写入**（合并镜像会覆盖 NVS，导致配对信息丢失）：
+**方式一：单文件（最简单，会清空 NVS 配对）**
+
+Release 中的 `SonyGPS-4.9.2-flash-kit.zip` 已包含单文件固件与一键脚本：
+
+```bash
+./flash-macos.sh            # macOS / Linux，自动找串口
+flash-windows.bat COM3      # Windows
+```
+
+等价命令：
+
+```bash
+esptool --chip esp32s3 --port <PORT> write-flash 0x0 sony-gps-logger-4.9.2.bin
+```
+
+> 单文件从 0x0 整片写入，NVS 会被清空：**已保存的相机会丢失，需要重新配对**。
+> GPX 轨迹与设置文件在 LittleFS 分区，不受影响。
+
+**方式二：分区写入（保留 NVS 配对）**
 
 ```bash
 esptool --chip esp32s3 --port <PORT> write-flash \
