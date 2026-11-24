@@ -205,7 +205,7 @@ static HardwareSerial GPSSerial(2);
 #define GPScam_NAME "Sony Camera GPS Logger"
 #define GPScam_VER_MAJOR 4
 #define GPScam_VER_MINOR 9
-#define GPScam_VER_PATCH 0
+#define GPScam_VER_PATCH 1
 #define GPScam_VERSION_STR(maj, min, pat) \
   #maj "." #min "." #pat
 #define GPScam_VERSION_NO_V \
@@ -340,6 +340,9 @@ static bool     promptOn     = true;
 #define AUTO_REC_OFF_MS (30u * 60u * 1000u)
 static bool     autoRec        = false;
 static bool     autoRecStarted = false;
+// 4.9.1: 只有"开机时设置已开启"才自动启动；本次开机内切换开关不触发，
+// 避免在菜单里一打开就立刻开始记录。
+static bool     autoRecArmedAtBoot = false;
 static uint32_t effectiveAutoOffMs(void) {
   return autoRec ? AUTO_REC_OFF_MS : autoOffMs;
 }
@@ -1024,6 +1027,10 @@ static void drawSliderP(int x, int y, int w, int idx, int count, bool active) {
     d.fillRect(x + fill, y - 3, 9, 10, active ? TFT_YELLOW : TFT_WHITE);
   }
 }
+// 整行清屏计数：其他行（尤其时钟行）变化时会铺满整行，把时钟行右侧的
+// AUTO 角标一起擦掉；角标据此强制重画，否则会"消失"。
+static uint32_t rowClearSeq = 0;
+
 // Rewrite one row ONLY when its text/colour changed. Equal-length text is
 // overdrawn with an opaque background, so there is never a black flash.
 static void putRow(int i, uint16_t color, const char *text) {
@@ -1036,7 +1043,10 @@ static void putRow(int i, uint16_t color, const char *text) {
   r.last[sizeof(r.last) - 1] = 0;
   auto &d = M5.Display;
   int h = r.size == 3 ? 24 : (r.size == 2 ? 16 : 8);
-  if (!sameLen) d.fillRect(0, r.y, d.width(), h, TFT_BLACK);
+  if (!sameLen) {
+    d.fillRect(0, r.y, d.width(), h, TFT_BLACK);
+    rowClearSeq++;
+  }
   useAsciiFont();                 // guards against a leftover CN font
   d.setTextSize(r.size);
   d.setTextColor(color, TFT_BLACK);
@@ -1116,11 +1126,14 @@ static void drawChargingText(bool plugged, bool full) {
 
 // 时钟行右上角的 AUTO 指示：开启自动记录后显示；自动开始记录后转为绿色。
 static int8_t autoBadgeShown = -1;   // -1 未画, 0 隐藏, 1 黄(待启动), 2 绿(已启动)
+static uint32_t autoBadgeSeq = 0;
 static void autoBadgeInvalidate(void) { autoBadgeShown = -1; }
 static void drawAutoBadge(void) {
   int state = autoRec ? (autoRecStarted ? 2 : 1) : 0;
-  if (state == autoBadgeShown) return;
+  // 其他行整行清屏会擦掉角标，seq 变化时强制重画
+  if (state == autoBadgeShown && autoBadgeSeq == rowClearSeq) return;
   autoBadgeShown = (int8_t)state;
+  autoBadgeSeq = rowClearSeq;
   auto &d = M5.Display;
   useAsciiFont();
   d.setTextSize(1);
@@ -1212,7 +1225,6 @@ static void drawPortraitChrome() {
 static void drawMainPortrait() {
   char b[40];
   drawPortraitChrome();
-  drawAutoBadge();
 
   // P_CLOCK: time only (8 size2 chars = 96 px of the 135 px width).
   if (gps.timeValid) {
@@ -1336,6 +1348,8 @@ static void drawMainPortrait() {
   }
 
   drawBottomRow(P_HINT);
+  // 放在最后：上面的行若有整行重绘，会先清掉 y=2..18 的区域
+  drawAutoBadge();
 }
 
 // Main-screen entry point: settle the SNR window once per second, then paint
@@ -1901,9 +1915,11 @@ static void handleSerialCmd() {
                     (unsigned)recIntervalS, (unsigned long)(dimAfterMs / 1000),
                     (unsigned long)(autoOffMs / 1000), (unsigned)brightHigh,
                     promptOn ? 1 : 0);
-      Serial.printf("[CFG] gnss=%s(%d) portrait=1 imu=%d spd=%d\n",
+      Serial.printf("[CFG] gnss=%s(%d) portrait=1 imu=%d spd=%d auto=%d armed=%d started=%d\n",
                     GNSS_LABELS[gnssMode], (int)gnssMode,
-                    M5.Imu.isEnabled() ? 1 : 0, spdKmh());
+                    M5.Imu.isEnabled() ? 1 : 0, spdKmh(),
+                    autoRec ? 1 : 0, autoRecArmedAtBoot ? 1 : 0,
+                    autoRecStarted ? 1 : 0);
       Serial.printf("[WAKE] graceLeft=%ld status=\"%s\" idle=%lu dimA=%lus\n",
                     (long)(int32_t)(wakeGraceUntilMs - millis()), statusMsg,
                     (unsigned long)(millis() - lastActivityMs),
@@ -2172,18 +2188,11 @@ static void onKeyClick(int idx) {
       case 3: {                                                   // AUTO REC
         autoRec = !autoRec;
         if (!autoRec) autoRecStarted = false;
+        // 4.9.1: 本次开机内不再自动启动，只有下次开机才生效
+        autoRecArmedAtBoot = false;
         saveSettings();
-        appLog("[AUTO] %s", autoRec ? "on" : "off");
-        setStatus(autoRec ? "AUTO ON" : "AUTO OFF");
-        // 打开时若已拿到时间，立即开始，不必等下次开机
-        if (autoRec && !recording && !autoRecStarted && gps.timeValid && fsOk
-            && !lowBatLock) {
-          if (startRecording()) {
-            autoRecStarted = true;
-            setStatus("AUTO REC");
-            appLog("[REC] auto start (menu)");
-          }
-        }
+        appLog("[AUTO] %s (takes effect next boot)", autoRec ? "on" : "off");
+        setStatus(autoRec ? "AUTO ON NEXT BOOT" : "AUTO OFF");
         drawMenuUI();
         break;
       }
@@ -2437,6 +2446,7 @@ void setup() {
                 fsOk ? (unsigned)(LittleFS.totalBytes() - LittleFS.usedBytes()) : 0u);
   loadKeySwap();
   loadSettings();
+  autoRecArmedAtBoot = autoRec;   // 4.9.1: 仅开机时已开启才允许自动启动
   {
     uint8_t wsrc = M5.In_I2C.readRegister8(0x6E, 0x05, 100000);
     uint8_t psrc = M5.In_I2C.readRegister8(0x6E, 0x04, 100000);
@@ -2520,8 +2530,8 @@ void loop() {
   }
   checkBattery();
 
-  // 自动记录：本次开机拿到 GPS 时间后自动开始一次（用户手动停止后不再重启）
-  if (autoRec && !autoRecStarted && !recording && !dumping && fsOk
+  // 自动记录：只有开机时已开启（armed）才在拿到 GPS 时间后自动开始一次
+  if (autoRecArmedAtBoot && !autoRecStarted && !recording && !dumping && fsOk
       && gps.timeValid && !lowBatLock) {
     if (startRecording()) {
       autoRecStarted = true;
