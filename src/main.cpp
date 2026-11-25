@@ -205,7 +205,7 @@ static HardwareSerial GPSSerial(2);
 #define GPScam_NAME "Sony Camera GPS Logger"
 #define GPScam_VER_MAJOR 4
 #define GPScam_VER_MINOR 9
-#define GPScam_VER_PATCH 3
+#define GPScam_VER_PATCH 4
 #define GPScam_VERSION_STR(maj, min, pat) \
   #maj "." #min "." #pat
 #define GPScam_VERSION_NO_V \
@@ -1897,6 +1897,7 @@ static KeyState keys[2] = {
 };
 
 static void powerOffNow();
+static void pmicShutdownSeq(void);   // 0x0C = 0xA1，多次重试
 static void toggleRecording(const char *keyName);
 static void onKeyClick(int idx);
 static void onKeyHold(int idx);
@@ -2072,6 +2073,9 @@ static void handleSerialCmd() {
       delAllStage = 0;
       setUiMode(UI_DELALL);
       Serial.printf("[TEST] delete-all page, %d files\n", fileCount);
+    }
+    else if (c == 'O') {                   // 测试钩子：PMIC 关机命令
+      pmicShutdownSeq();
     }
     else if (c == 'F') {          // headless regression for the wake banner
       dimmed = true;
@@ -2380,27 +2384,18 @@ static void powerOffNow() {
   d.setTextColor(TFT_SILVER, TFT_BLACK);
   d.setCursor(20, 98); d.print("Press POWER key to restart");
   Serial.println("[PWR] shutdown");
-  delay(900);
-  M5.Power.powerOff();              // M5PM1_Class::powerOff -> reg 0x0C = 0xA1
-  // Fallback in case M5Unified's PMIC handle was not initialised.
-  M5.In_I2C.writeRegister8(0x6E, 0x0C, 0xA1, 100000);
-  delay(1500);
-  // 2.0.1: if 5 V is still present the PMIC refused to cut power (typical when
-  // powered over USB). esp_restart() here would look like an unexplained
-  // REBOOT, which is exactly what a wake-up key press used to trigger. Stay on
-  // and say why instead; esp_restart() is only used on battery, where power
-  // off genuinely failed.
-  int16_t vbus = M5.Power.getVBUSVoltage();
-  if (vbus > 3500) {
-    autoOffReason = false;
-    Serial.printf("[PWR] powerOff refused (VBUS=%dmV) - staying on\n", (int)vbus);
-    uiMode = UI_MAIN;
-    uiReset();
-    drawMainUI();
-    setStatus("USB POWER - CANNOT OFF");
-    return;
-  }
-  esp_restart();
+  delay(400);                        // 让 SAVED / POWER OFF 提示先显示出来
+  // 4.9.4: 直接向 M5PM1 发送带 0xA0 密钥的关机命令并重试。
+  // 之前先调用 M5.Power.powerOff() 会写一个不带密钥的 0x01，PMIC 不执行，
+  // 紧接着的 0xA1 又因间隔太短被忽略，结果菜单关机无效。
+  pmicShutdownSeq();
+  // 仍然活着：说明 PMIC 拒绝关机（例如 USB 供电）。恢复界面提示，不重启。
+  autoOffReason = false;
+  Serial.println("[PWR] powerOff failed - staying on");
+  uiMode = UI_MAIN;
+  uiReset();
+  drawMainUI();
+  setStatus("POWER OFF FAILED");
 }
 
 // ---------------- setup / loop ----------------
@@ -2448,6 +2443,18 @@ static const char *resetReasonName(esp_reset_reason_t r) {
 // 这里按 10 秒周期喂狗（0x0B 写 0xA5），保留 PMIC 保护。
 static void pmicWdtFeed(void) {
   M5.In_I2C.writeRegister8(0x6E, 0x0B, 0xA5, 100000);
+}
+
+// M5PM1 关机：0x0C 高 4 位必须是密钥 0xA，低 2 位 01=关机 => 0xA1。
+// 命令前需短暂空闲（库实现里等 120 ms），一次不成功就重试几次。
+static void pmicShutdownSeq(void) {
+  Serial.println("[PWR] PMIC shutdown 0x0C=0xA1");
+  delay(120);
+  for (int i = 0; i < 3; i++) {
+    M5.In_I2C.writeRegister8(0x6E, 0x0C, 0xA1, 100000);
+    delay(250);
+  }
+  Serial.println("[PWR] still alive after shutdown cmd");
 }
 
 // PMIC（M5PM1, 0x6E）按钮配置：默认双击关机是关闭的，且这个设置可能被

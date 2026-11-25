@@ -1,6 +1,6 @@
 @echo off
 setlocal
-set BIN=%~dp0sony-gps-logger-4.9.3.bin
+set BIN=%~dp0sony-gps-logger-4.9.4.bin
 set PORT=%~1
 if "%PORT%"=="" set PORT=COM3
 echo Port: %PORT%

@@ -45,7 +45,7 @@ pio run -e sticks3
 
 **方式一：单文件（最简单，会清空 NVS 配对）**
 
-Release 中的 `SonyGPS-4.9.3-flash-kit.zip` 已包含单文件固件与一键脚本：
+Release 中的 `SonyGPS-4.9.4-flash-kit.zip` 已包含单文件固件与一键脚本：
 
 ```bash
 ./flash-macos.sh            # macOS / Linux，自动找串口
@@ -55,7 +55,7 @@ flash-windows.bat COM3      # Windows
 等价命令：
 
 ```bash
-esptool --chip esp32s3 --port <PORT> write-flash 0x0 sony-gps-logger-4.9.3.bin
+esptool --chip esp32s3 --port <PORT> write-flash 0x0 sony-gps-logger-4.9.4.bin
 ```
 
 > 单文件从 0x0 整片写入，NVS 会被清空：**已保存的相机会丢失，需要重新配对**。
